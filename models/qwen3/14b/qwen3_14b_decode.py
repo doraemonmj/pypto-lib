@@ -57,7 +57,8 @@ EPS = 1e-6
 HIDDEN_INV = 1.0 / HIDDEN
 
 # Scope 1 tiling constants.
-INPUT_PROJ_K_CHUNK = 128
+INPUT_PROJ_K_CHUNK = 256
+KV_PROJ_K_CHUNK = 256
 Q_OUT_CHUNK = 256
 KV_OUT_CHUNK = 256
 BATCH_TILE = 16
@@ -71,11 +72,11 @@ SB_BATCH = 128
 BLOCK_SIZE = SEQ_TILE
 
 # Scope 3 tiling constants.
-K_CHUNK = 128
-OUT_PROJ_K_CHUNK = 512  # out_proj K block: larger K tile improves L0B utilization.
-OUT_PROJ_N_CHUNK = 64
+K_CHUNK = 256
+OUT_PROJ_K_CHUNK = 256
+OUT_PROJ_N_CHUNK = 256
 MLP_OUT_CHUNK = 256
-DOWN_MLP_CHUNK = 128
+DOWN_MLP_CHUNK = 256
 DOWN_OUT_CHUNK = 256
 
 
@@ -97,6 +98,7 @@ def build_qwen3_decode_program(
     kv_hidden = num_kv_heads * head_dim
     inter = intermediate_size
     input_proj_k_blocks = hidden // INPUT_PROJ_K_CHUNK
+    kv_proj_k_blocks = hidden // KV_PROJ_K_CHUNK
     out_proj_k_blocks = hidden // OUT_PROJ_K_CHUNK
     hidden_blocks = hidden // K_CHUNK
     down_out_blocks = hidden // DOWN_OUT_CHUNK
@@ -226,21 +228,28 @@ def build_qwen3_decode_program(
                         q_proj = pl.assemble(q_proj, q_acc, [b0, q0])
 
                 for kv0 in pl.parallel(0, kv_hidden, KV_OUT_CHUNK):
-                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_proj"):
+                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="k_proj"):
                         k_acc = pl.create_tensor([BATCH_TILE, KV_OUT_CHUNK], dtype=pl.FP32)
-                        v_acc = pl.create_tensor([BATCH_TILE, KV_OUT_CHUNK], dtype=pl.FP32)
-                        for kb in pl.pipeline(0, input_proj_k_blocks, stage=2):
-                            k0 = kb * INPUT_PROJ_K_CHUNK
-                            tile_a_i = normed_tile[:, k0 : k0 + INPUT_PROJ_K_CHUNK]
-                            tile_wk_i = wk[k0 : k0 + INPUT_PROJ_K_CHUNK, kv0 : kv0 + KV_OUT_CHUNK]
-                            tile_wv_i = wv[k0 : k0 + INPUT_PROJ_K_CHUNK, kv0 : kv0 + KV_OUT_CHUNK]
+                        for kb in pl.pipeline(0, kv_proj_k_blocks, stage=2):
+                            k0 = kb * KV_PROJ_K_CHUNK
+                            k_tile_a_i = normed_tile[:, k0 : k0 + KV_PROJ_K_CHUNK]
+                            k_tile_w_i = wk[k0 : k0 + KV_PROJ_K_CHUNK, kv0 : kv0 + KV_OUT_CHUNK]
                             if k0 == 0:
-                                k_acc = pl.matmul(tile_a_i, tile_wk_i, out_dtype=pl.FP32)
-                                v_acc = pl.matmul(tile_a_i, tile_wv_i, out_dtype=pl.FP32)
+                                k_acc = pl.matmul(k_tile_a_i, k_tile_w_i, out_dtype=pl.FP32)
                             else:
-                                k_acc = pl.matmul_acc(k_acc, tile_a_i, tile_wk_i)
-                                v_acc = pl.matmul_acc(v_acc, tile_a_i, tile_wv_i)
+                                k_acc = pl.matmul_acc(k_acc, k_tile_a_i, k_tile_w_i)
                         k_proj = pl.assemble(k_proj, k_acc, [b0, kv0])
+
+                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="v_proj"):
+                        v_acc = pl.create_tensor([BATCH_TILE, KV_OUT_CHUNK], dtype=pl.FP32)
+                        for kb in pl.pipeline(0, kv_proj_k_blocks, stage=2):
+                            k0 = kb * KV_PROJ_K_CHUNK
+                            v_tile_a_i = normed_tile[:, k0 : k0 + KV_PROJ_K_CHUNK]
+                            v_tile_w_i = wv[k0 : k0 + KV_PROJ_K_CHUNK, kv0 : kv0 + KV_OUT_CHUNK]
+                            if k0 == 0:
+                                v_acc = pl.matmul(v_tile_a_i, v_tile_w_i, out_dtype=pl.FP32)
+                            else:
+                                v_acc = pl.matmul_acc(v_acc, v_tile_a_i, v_tile_w_i)
                         v_proj = pl.assemble(v_proj, v_acc, [b0, kv0])
 
             # HF-style per-head q_norm / k_norm before RoPE, batched to avoid
@@ -529,7 +538,7 @@ def build_qwen3_decode_program(
                 resid1_tile = pl.create_tensor([BATCH_TILE, hidden], dtype=pl.FP32)
 
                 with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk, pl.split(pl.SplitMode.UP_DOWN)], name_hint="out_proj_residual"):
-                    for ob in pl.parallel(0, out_proj_n_blocks, chunk=6):
+                    for ob in pl.parallel(0, out_proj_n_blocks, chunk=1):
                         o0 = ob * OUT_PROJ_N_CHUNK
 
                         hidden_chunk = pl.slice(
