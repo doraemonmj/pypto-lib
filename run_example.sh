@@ -2,7 +2,7 @@
 # Run a pypto-lib example with all required environment variables configured.
 # Usage:
 #   ./run_example.sh examples/beginner/hello_world.py
-#   ./run_example.sh examples/beginner/hello_world.py -p a2a3sim
+#   ./run_example.sh examples/beginner/hello_world.py -p a2a3
 #   ./run_example.sh -l                              # list available examples
 
 ##### conda activate mj
@@ -12,6 +12,8 @@ export PATH=/usr/local/bin/ptoas-bin:$PATH
 export PTOAS_ROOT=/usr/local/bin/ptoas-bin
 export PTO_ISA_ROOT="${PTO_ISA_ROOT:-/data/m00956180/runtime/pto-isa}"
 export SIMPLER_ROOT="${SIMPLER_ROOT:-/data/m00956180/runtime/pypto-v2-ir/runtime}"
+SIMPLER_BUILD="${SIMPLER_ROOT}/build/cp310-cp310-linux_aarch64/python/bindings"
+export PYTHONPATH="${SIMPLER_ROOT}:${SIMPLER_ROOT}/python:${SIMPLER_BUILD}:${PYTHONPATH:-}"
 export ASCEND_HOME_PATH="${ASCEND_HOME_PATH:-/usr/local/Ascend/cann-9.0.0}"
 
 # export SIMPLER_ROOT="${SIMPLER_ROOT:-$WORKSPACE_DIR/simpler-zhusy54}"
@@ -23,7 +25,7 @@ echo "  PTOAS_ROOT=$PTOAS_ROOT"
 echo "  PTO_ISA_ROOT=$PTO_ISA_ROOT"
 echo "  SIMPLER_ROOT=$SIMPLER_ROOT"
 echo "  ASCEND_HOME_PATH=$ASCEND_HOME_PATH"
-EXAMPLE=examples/intermediate/wse-ffn.py
+EXAMPLE=examples/intermediate/wse-ffn-InCore-v1.py
 DEVICE=15
 echo "=== Running: $EXAMPLE $@ (via task-submit --device $DEVICE) ==="
 exec task-submit --device "$DEVICE" --run "python3 $EXAMPLE $*"
