@@ -6,6 +6,14 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
+#
+# v2: single InCore kernel merging gate/up (phase 1) and down (phase 2), both
+# SPMD-split on the N axis. Phase 2's reduction axis is INTER (== phase 1's N),
+# so each phase-2 block needs the *full* ffn tensor across all phase-1 blocks.
+# That requires a grid-wide synchronization between the two phases, which the
+# framework does not yet expose. The sync point is marked by `_grid_sync()`
+# below as a PLACEHOLDER (currently an identity no-op) until a real barrier
+# primitive is available.
 
 from __future__ import annotations
 
@@ -15,10 +23,6 @@ BATCH = 16
 HIDDEN = 7168
 INTERMEDIATE = 3072  # example/test shape; wse-ffn production shape may vary
 
-# Tiling constants, named by matmul role (M/N/K) per phase.
-# M tile = batch tile, shared across both phases.
-# Phase 1 (gate/up): M=BATCH, N=INTER,  K=HIDDEN
-# Phase 2 (down):    M=BATCH, N=HIDDEN, K=INTER
 M_TILE = 16
 P1_N_TILE = 128
 P1_K_TILE = 128
@@ -28,6 +32,18 @@ P2_K_TILE = 128
 # Legacy aliases retained for the golden reference.
 K_CHUNK = P1_K_TILE
 FFN_OUT_CHUNK = P1_N_TILE
+
+
+def _grid_sync(ffn_scratch):
+    """PLACEHOLDER grid-wide barrier.
+
+    Phase 2 needs every phase-1 block's contribution to `ffn_scratch` before
+    it can start its INTER-axis reduction. A real implementation must block
+    each SPMD block until all blocks have finished writing `ffn_scratch`.
+    No such primitive exists yet, so this is a no-op identity pass-through.
+    """
+    # TODO: replace with a real grid-wide barrier once the framework exposes one.
+    return ffn_scratch
 
 
 def build_wse_ffn_program(
@@ -47,41 +63,50 @@ def build_wse_ffn_program(
     P2_N_BLOCKS = (HIDDEN_SIZE + P2_N_TILE - 1) // P2_N_TILE
     P2_K_BLOCKS = (INTER_SIZE  + P2_K_TILE - 1) // P2_K_TILE
 
+    # Single merged grid must cover both phases' block counts.
+    P1_GRID = M_BLOCKS * P1_N_BLOCKS
+    P2_GRID = M_BLOCKS * P2_N_BLOCKS
+    GRID = max(P1_GRID, P2_GRID)
+
     @pl.program
     class WseFFN:
-        # Phase-1 InCore kernel: one (M_TILE, P1_N_TILE) output tile per core.
+        # Merged InCore kernel: each block runs phase-1 (if in P1 range),
+        # then the grid sync, then phase-2 (if in P2 range).
         @pl.function(type=pl.FunctionType.InCore)
-        def kernel_gate_up(
+        def kernel_ffn(
             self,
             post_norm: pl.Tensor[[BATCH_SIZE, HIDDEN_SIZE], pl.BF16],
             w_gate: pl.Tensor[[HIDDEN_SIZE, INTER_SIZE], pl.BF16],
             w_up: pl.Tensor[[HIDDEN_SIZE, INTER_SIZE], pl.BF16],
+            w_down: pl.Tensor[[INTER_SIZE, HIDDEN_SIZE], pl.BF16],
             ffn_scratch: pl.InOut[pl.Tensor[[BATCH_SIZE, INTER_SIZE], pl.BF16]],
-        ) -> pl.Tensor[[BATCH_SIZE, INTER_SIZE], pl.BF16]:
+            out: pl.Out[pl.Tensor[[BATCH_SIZE, HIDDEN_SIZE], pl.FP32]],
+        ) -> pl.Tensor[[BATCH_SIZE, HIDDEN_SIZE], pl.FP32]:
             idx = pl.tile.get_block_idx()
-            m0 = (idx // P1_N_BLOCKS) * M_TILE
-            n0 = (idx %  P1_N_BLOCKS) * P1_N_TILE
 
-            x_full = pl.load(post_norm, [m0, 0], [M_TILE, HIDDEN_SIZE], target_memory=pl.MemorySpace.Mat)
+            # ---- Phase 1: gate/up, SPMD-split on N=INTER ----
+            p1_m0 = (idx // P1_N_BLOCKS) * M_TILE
+            p1_n0 = (idx %  P1_N_BLOCKS) * P1_N_TILE
 
-            # K-reduction (sequential, accumulator dependency).
+            x_full = pl.load(post_norm, [p1_m0, 0], [M_TILE, HIDDEN_SIZE], target_memory=pl.MemorySpace.Mat)
+
             x0 = pl.slice(x_full, [M_TILE, P1_K_TILE], [0, 0])
-            wg0 = pl.load(w_gate, [0, n0], [P1_K_TILE, P1_N_TILE], target_memory=pl.MemorySpace.Mat)
+            wg0 = pl.load(w_gate, [0, p1_n0], [P1_K_TILE, P1_N_TILE], target_memory=pl.MemorySpace.Mat)
             gate_acc = pl.matmul(x0, wg0)
             for kb in pl.range(1, P1_K_BLOCKS):
                 k0 = kb * P1_K_TILE
                 xi = pl.slice(x_full, [M_TILE, P1_K_TILE], [0, k0])
-                wg = pl.load(w_gate, [k0, n0], [P1_K_TILE, P1_N_TILE], target_memory=pl.MemorySpace.Mat)
+                wg = pl.load(w_gate, [k0, p1_n0], [P1_K_TILE, P1_N_TILE], target_memory=pl.MemorySpace.Mat)
                 gate_acc = pl.matmul_acc(gate_acc, xi, wg)
             gate_vec = pl.move(gate_acc, target_memory=pl.MemorySpace.Vec, blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.none_box)
 
             x1 = pl.slice(x_full, [M_TILE, P1_K_TILE], [0, 0])
-            wu0 = pl.load(w_up, [0, n0], [P1_K_TILE, P1_N_TILE], target_memory=pl.MemorySpace.Mat)
+            wu0 = pl.load(w_up, [0, p1_n0], [P1_K_TILE, P1_N_TILE], target_memory=pl.MemorySpace.Mat)
             up_acc = pl.matmul(x1, wu0)
             for kb in pl.range(1, P1_K_BLOCKS):
                 k0 = kb * P1_K_TILE
                 xj = pl.slice(x_full, [M_TILE, P1_K_TILE], [0, k0])
-                wu = pl.load(w_up, [k0, n0], [P1_K_TILE, P1_N_TILE], target_memory=pl.MemorySpace.Mat)
+                wu = pl.load(w_up, [k0, p1_n0], [P1_K_TILE, P1_N_TILE], target_memory=pl.MemorySpace.Mat)
                 up_acc = pl.matmul_acc(up_acc, xj, wu)
 
             sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_vec)), 1.0))
@@ -89,33 +114,28 @@ def build_wse_ffn_program(
             up_vec = pl.move(up_acc, target_memory=pl.MemorySpace.Vec, blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.none_box)
             ffn_chunk = pl.mul(gate_silu, up_vec)
             ffn_bf16 = pl.cast(ffn_chunk, target_type=pl.BF16)
-            ffn_scratch = pl.store(ffn_bf16, [m0, n0], ffn_scratch)
-            return ffn_scratch
+            ffn_scratch = pl.store(ffn_bf16, [p1_m0, p1_n0], ffn_scratch)
 
-        # Phase-2 InCore kernel: one (M_TILE, P2_N_TILE) output tile per core.
-        @pl.function(type=pl.FunctionType.InCore)
-        def kernel_down(
-            self,
-            ffn_scratch: pl.Tensor[[BATCH_SIZE, INTER_SIZE], pl.BF16],
-            w_down: pl.Tensor[[INTER_SIZE, HIDDEN_SIZE], pl.BF16],
-            out: pl.Out[pl.Tensor[[BATCH_SIZE, HIDDEN_SIZE], pl.FP32]],
-        ) -> pl.Tensor[[BATCH_SIZE, HIDDEN_SIZE], pl.FP32]:
-            idx = pl.tile.get_block_idx()
-            m0 = (idx // P2_N_BLOCKS) * M_TILE
-            n0 = (idx %  P2_N_BLOCKS) * P2_N_TILE
+            # ---- Grid-wide sync (PLACEHOLDER) ----
+            # Every block must have written its INTER column band before any
+            # block reads the full ffn for phase 2.
+            ffn_scratch = _grid_sync(ffn_scratch)
 
-            ffn_full = pl.load(ffn_scratch, [m0, 0], [M_TILE, INTER_SIZE], target_memory=pl.MemorySpace.Mat)
+            # ---- Phase 2: down, SPMD-split on N=HIDDEN, K=INTER ----
+            p2_m0 = (idx // P2_N_BLOCKS) * M_TILE
+            p2_n0 = (idx %  P2_N_BLOCKS) * P2_N_TILE
 
-            # K-reduction along INTER_SIZE (sequential, accumulator dependency).
+            ffn_full = pl.load(ffn_scratch, [p2_m0, 0], [M_TILE, INTER_SIZE], target_memory=pl.MemorySpace.Mat)
+
             ffn0 = pl.slice(ffn_full, [M_TILE, P2_K_TILE], [0, 0])
-            wd0 = pl.load(w_down, [0, n0], [P2_K_TILE, P2_N_TILE], target_memory=pl.MemorySpace.Mat)
+            wd0 = pl.load(w_down, [0, p2_n0], [P2_K_TILE, P2_N_TILE], target_memory=pl.MemorySpace.Mat)
             down_acc = pl.matmul(ffn0, wd0)
             for ob in pl.range(1, P2_K_BLOCKS):
                 k0 = ob * P2_K_TILE
                 ffn_i = pl.slice(ffn_full, [M_TILE, P2_K_TILE], [0, k0])
-                wd_i = pl.load(w_down, [k0, n0], [P2_K_TILE, P2_N_TILE], target_memory=pl.MemorySpace.Mat)
+                wd_i = pl.load(w_down, [k0, p2_n0], [P2_K_TILE, P2_N_TILE], target_memory=pl.MemorySpace.Mat)
                 down_acc = pl.matmul_acc(down_acc, ffn_i, wd_i)
-            out = pl.store(down_acc, [m0, n0], out)
+            out = pl.store(down_acc, [p2_m0, p2_n0], out)
             return out
 
         @pl.function(type=pl.FunctionType.Orchestration)
@@ -129,13 +149,9 @@ def build_wse_ffn_program(
         ) -> pl.Tensor[[BATCH_SIZE, HIDDEN_SIZE], pl.FP32]:
             ffn_scratch = pl.create_tensor([BATCH_SIZE, INTER_SIZE], dtype=pl.BF16)
 
-            # Phase 1: SPMD dispatch across (M_BLOCKS × P1_N_BLOCKS) grid.
-            with pl.spmd(M_BLOCKS * P1_N_BLOCKS):
-                ffn_scratch = self.kernel_gate_up(post_norm, w_gate, w_up, ffn_scratch)
-
-            # Phase 2: SPMD dispatch across (M_BLOCKS × P2_N_BLOCKS) grid.
-            with pl.spmd(M_BLOCKS * P2_N_BLOCKS):
-                out = self.kernel_down(ffn_scratch, w_down, out)
+            # Single SPMD dispatch over the merged grid.
+            with pl.spmd(GRID):
+                out = self.kernel_ffn(post_norm, w_gate, w_up, w_down, ffn_scratch, out)
 
             return out
 
@@ -191,7 +207,6 @@ def golden_wse_ffn(tensors):
     k_chunk = K_CHUNK
     ffn_out_chunk = FFN_OUT_CHUNK
 
-    # SwiGLU: gate + up projections (chunked BF16 matmul, FP32 accumulation).
     ffn_bf16 = torch.zeros(batch, inter_size, dtype=torch.bfloat16)
     for o0 in range(0, inter_size, ffn_out_chunk):
         gate_acc = torch.zeros(batch, ffn_out_chunk, dtype=torch.float32)
@@ -203,7 +218,6 @@ def golden_wse_ffn(tensors):
         sigmoid = torch.reciprocal(torch.exp(-gate_acc) + 1.0)
         ffn_bf16[:, o0:o0 + ffn_out_chunk] = (gate_acc * sigmoid * up_acc).bfloat16()
 
-    # Down projection (chunked BF16 matmul, FP32 accumulation). Output stays FP32.
     out = torch.zeros(batch, hidden_size, dtype=torch.float32)
     for d0 in range(0, hidden_size, k_chunk):
         down_acc = torch.zeros(batch, k_chunk, dtype=torch.float32)
