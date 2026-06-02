@@ -186,53 +186,19 @@ def _build_ep_moe_program():
             )
             return sh
 
-        @pl.function(type=pl.FunctionType.Inline)
-        def pack_step(
-            self,
-            x_norm_scale: pl.Tensor[[T, 1], pl.FP32],
-            weights: pl.Tensor[[T, TOPK], pl.FP32],
-            scale_padded: pl.Out[pl.Tensor[[T, W_PAD], pl.FP32]],
-            weight_padded: pl.Out[pl.Tensor[[N_ROUTES, W_PAD], pl.FP32]],
-            r_route_padded: pl.Out[pl.Tensor[[N_ROUTES, IDX_PAD], pl.INT32]],
-        ) -> tuple[
-            pl.Tensor[[T, W_PAD], pl.FP32],
-            pl.Tensor[[N_ROUTES, W_PAD], pl.FP32],
-            pl.Tensor[[N_ROUTES, IDX_PAD], pl.INT32],
-        ]:
-            # Pad scale/weight/r_route to 32B-aligned tile widths so dispatch
-            # can use single TILE remote_store pushes. Columns 1..PAD-1 stay 0
-            # so the stage-out row_sum trick recovers column 0 exactly.
-            for t in pl.range(T):
-                s_val = pl.read(x_norm_scale, [t, 0])
-                pl.write(scale_padded, [t, 0], s_val)
-                for sp in pl.range(1, W_PAD):
-                    pl.write(scale_padded, [t, sp], 0.0)
-                for k in pl.range(TOPK):
-                    w_val = pl.read(weights, [t, k])
-                    r_route = pl.cast(t * TOPK + k, pl.INT32)
-                    pl.write(weight_padded, [t * TOPK + k, 0], w_val)
-                    for wp in pl.range(1, W_PAD):
-                        pl.write(weight_padded, [t * TOPK + k, wp], 0.0)
-                    pl.write(r_route_padded, [t * TOPK + k, 0], r_route)
-                    for ip in pl.range(1, IDX_PAD):
-                        pl.write(
-                            r_route_padded,
-                            [t * TOPK + k, ip],
-                            pl.cast(0, pl.INT32),
-                        )
-            return scale_padded, weight_padded, r_route_padded
-
         # --- Step 2: dispatch (cross-rank #1) ----------------------------
         # 1:1 of test_l3_ep_dispatch_combine.dispatch_step but with FOUR push
-        # channels: x_i8 INT8, scale FP32, weight FP32, r_route INT32.
+        # channels: x_i8 INT8, scale FP32, weight FP32, r_route INT32. The
+        # scale/weight/r_route channels are padded inline to 32B-aligned
+        # tiles right before each remote_store so we don't need host-backed
+        # padded scratch tensors.
         @pl.function(type=pl.FunctionType.InCore)
         def dispatch_step(  # noqa: PLR0913, PLR0915
             self,
             indices: pl.Tensor[[T, TOPK], pl.INT32],
             x_norm_i8: pl.Tensor[[T, D], pl.INT8],
-            scale_padded: pl.Tensor[[T, W_PAD], pl.FP32],
-            weight_padded: pl.Tensor[[N_ROUTES, W_PAD], pl.FP32],
-            r_route_padded: pl.Tensor[[N_ROUTES, IDX_PAD], pl.INT32],
+            x_norm_scale: pl.Tensor[[T, 1], pl.FP32],
+            weights: pl.Tensor[[T, TOPK], pl.FP32],
             recv_x_out: pl.Out[pl.Tensor[[N_LOCAL * RECV_MAX, D], pl.INT8]],
             recv_scale_out: pl.Out[pl.Tensor[[N_LOCAL, RECV_MAX], pl.FP32]],
             recv_w_out: pl.Out[pl.Tensor[[N_LOCAL, RECV_MAX], pl.FP32]],
@@ -240,7 +206,10 @@ def _build_ep_moe_program():
             recv_count_out: pl.Out[pl.Tensor[[N_LOCAL, 1], pl.INT32]],
             pub_counts: pld.DistributedTensor[[N_RANKS * N_RANKS, N_LOCAL], pl.INT32],
             count_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-            recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
+            # ``recv_x`` is widened to FP16 to work around a b8 SDMA bug on
+            # a2a3 (see x_tile cast in payload_push below). ``recv_x_out``
+            # stays INT8 — the narrow cast happens in stage_out.
+            recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.FP16],
             recv_scale: pld.DistributedTensor[[N_LOCAL * RECV_MAX, W_PAD], pl.FP32],
             recv_w: pld.DistributedTensor[[N_LOCAL * RECV_MAX, W_PAD], pl.FP32],
             recv_r_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
@@ -325,6 +294,20 @@ def _build_ep_moe_program():
                 for e in pl.range(N_LOCAL):
                     cursor[d * N_LOCAL + e] = 0
 
+            # Allocate the three pad tiles once, zero-initialised. Columns
+            # 1..PAD-1 stay 0 across every push so the stage_out row_sum at
+            # the receiver recovers column 0 exactly. The loop body only
+            # overwrites column 0.
+            scale_tile: pl.Tile[[1, W_PAD], pl.FP32] = pl.tile.full(
+                [1, W_PAD], dtype=pl.FP32, value=0.0
+            )
+            w_tile: pl.Tile[[1, W_PAD], pl.FP32] = pl.tile.full(
+                [1, W_PAD], dtype=pl.FP32, value=0.0
+            )
+            idx_tile: pl.Tile[[1, IDX_PAD], pl.INT32] = pl.tile.full(
+                [1, IDX_PAD], dtype=pl.INT32, value=0
+            )
+
             for t in pl.range(T):
                 for k in pl.range(TOPK):
                     eid = pl.read(indices, [t, k])
@@ -336,18 +319,32 @@ def _build_ep_moe_program():
                     slot = slot_off + cur_val
                     row = loc_e * RECV_MAX + slot
                     cursor[bucket] = cur_val + 1
-                    r_route = t * TOPK + k
+                    r_route = pl.cast(t * TOPK + k, pl.INT32)
 
-                    x_tile = pl.load(x_norm_i8, [t, 0], [1, D])
+                    # Widen INT8 → FP16 before the cross-rank push: the
+                    # b8 SDMA burst path (``copy_ubuf_to_gm_align_b8``) is
+                    # broken on a2a3 — recv data lands stale on the peer.
+                    # b16 is fine, and FP16 is the only floating dtype that
+                    # the a2a3 ``TCVT`` table reaches from INT8 directly
+                    # (see ``TCvt.hpp``: ``I8 -> FP16`` is listed as a direct
+                    # path; INT8 → BF16 / INT8 → INT32 are not). FP16's
+                    # 10-bit mantissa exactly represents every INT8 value
+                    # in [-128, 127], so the round-trip is lossless. INT8
+                    # is recovered via the symmetric FP16 → INT8 cast in
+                    # stage_out below (also a documented direct path).
+                    x_tile_i8 = pl.load(x_norm_i8, [t, 0], [1, D])
+                    x_tile = pl.cast(x_tile_i8, target_type=pl.FP16)
                     pld.tile.remote_store(x_tile, target=recv_x, peer=dst, offsets=[row, 0])
 
-                    scale_tile = pl.load(scale_padded, [t, 0], [1, W_PAD])
+                    s_val = pl.read(x_norm_scale, [t, 0])
+                    pl.tile.write(scale_tile, [0, 0], s_val)
                     pld.tile.remote_store(scale_tile, target=recv_scale, peer=dst, offsets=[row, 0])
 
-                    w_tile = pl.load(weight_padded, [r_route, 0], [1, W_PAD])
+                    w_val = pl.read(weights, [t, k])
+                    pl.tile.write(w_tile, [0, 0], w_val)
                     pld.tile.remote_store(w_tile, target=recv_w, peer=dst, offsets=[row, 0])
 
-                    idx_tile = pl.load(r_route_padded, [r_route, 0], [1, IDX_PAD])
+                    pl.tile.write(idx_tile, [0, 0], r_route)
                     pld.tile.remote_store(idx_tile, target=recv_r_route, peer=dst, offsets=[row, 0])
 
             # ---------- data_done barrier ----------
@@ -374,12 +371,13 @@ def _build_ep_moe_program():
                     )
 
             # ---------- stage_out: window → host-backed ----------
-            # recv_x: per-row [1, D] INT8 tile copy.
+            # recv_x: per-row [1, D] FP16 → narrow back to INT8 host tensor.
             for e in pl.range(N_LOCAL):
                 for slot in pl.range(RECV_MAX):
                     row = e * RECV_MAX + slot
-                    x_tile = pl.load(recv_x, [row, 0], [1, D])
-                    pl.store(x_tile, [row, 0], recv_x_out)
+                    stage_x_fp16 = pl.load(recv_x, [row, 0], [1, D])
+                    stage_x_i8 = pl.cast(stage_x_fp16, target_type=pl.INT8)
+                    pl.store(stage_x_i8, [row, 0], recv_x_out)
 
             # recv_scale / recv_w: per-expert TROWSUM trick on [R, W_PAD] →
             # [R, 1] (column 0 is the real value; rest are zero), reshape and
@@ -559,7 +557,7 @@ def _build_ep_moe_program():
             # windows
             pub_counts: pld.DistributedTensor[[N_RANKS * N_RANKS, N_LOCAL], pl.INT32],
             count_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-            recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
+            recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.FP16],
             recv_scale: pld.DistributedTensor[[N_LOCAL * RECV_MAX, W_PAD], pl.FP32],
             recv_w: pld.DistributedTensor[[N_LOCAL * RECV_MAX, W_PAD], pl.FP32],
             recv_r_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
@@ -601,14 +599,6 @@ def _build_ep_moe_program():
                 sh,
             )
 
-            scale_padded = pl.create_tensor([T, W_PAD], dtype=pl.FP32)
-            weight_padded = pl.create_tensor([N_ROUTES, W_PAD], dtype=pl.FP32)
-            r_route_padded = pl.create_tensor([N_ROUTES, IDX_PAD], dtype=pl.INT32)
-            scale_padded, weight_padded, r_route_padded = self.pack_step(
-                x_norm_scale, weights,
-                scale_padded, weight_padded, r_route_padded,
-            )
-
             recv_x_out = pl.create_tensor([N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
             recv_scale_out = pl.create_tensor([N_LOCAL, RECV_MAX], dtype=pl.FP32)
             recv_w_out = pl.create_tensor([N_LOCAL, RECV_MAX], dtype=pl.FP32)
@@ -618,7 +608,7 @@ def _build_ep_moe_program():
                 recv_x_out, recv_scale_out, recv_w_out,
                 recv_r_route_out, recv_count_out,
             ) = self.dispatch_step(
-                indices, x_norm_i8, scale_padded, weight_padded, r_route_padded,
+                indices, x_norm_i8, x_norm_scale, weights,
                 recv_x_out, recv_scale_out, recv_w_out, recv_r_route_out, recv_count_out,
                 pub_counts, count_done,
                 recv_x, recv_scale, recv_w, recv_r_route,
@@ -674,7 +664,7 @@ def _build_ep_moe_program():
         ):
             pub_counts_buf = pld.alloc_window_buffer(N_RANKS * N_RANKS * N_LOCAL * 4)
             count_done_buf = pld.alloc_window_buffer(N_RANKS * 4)
-            recv_x_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * D * 1)  # INT8
+            recv_x_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * D * 2)  # FP16 (b8 a2a3 workaround)
             recv_scale_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * W_PAD * 4)  # FP32
             recv_w_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * W_PAD * 4)  # FP32
             recv_r_route_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * IDX_PAD * 4)  # INT32
@@ -686,7 +676,7 @@ def _build_ep_moe_program():
             for r in pl.range(pld.world_size()):
                 pub_counts = pld.window(pub_counts_buf, [N_RANKS * N_RANKS, N_LOCAL], dtype=pl.INT32)
                 count_done = pld.window(count_done_buf, [N_RANKS, 1], dtype=pl.INT32)
-                recv_x = pld.window(recv_x_buf, [N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
+                recv_x = pld.window(recv_x_buf, [N_LOCAL * RECV_MAX, D], dtype=pl.FP16)
                 recv_scale = pld.window(recv_scale_buf, [N_LOCAL * RECV_MAX, W_PAD], dtype=pl.FP32)
                 recv_w = pld.window(recv_w_buf, [N_LOCAL * RECV_MAX, W_PAD], dtype=pl.FP32)
                 recv_r_route = pld.window(recv_r_route_buf, [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
