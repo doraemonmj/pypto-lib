@@ -1162,7 +1162,177 @@ def _backend_type(platform: str) -> BackendType:
     return BackendType.Ascend950 if platform.startswith("a5") else BackendType.Ascend910B
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# On-the-fly random fixture + torch golden for the single-layer unit test.
+#
+# The default `-p a2a3 -d N` run builds a deterministic RANDOM fixture, computes
+# the golden with `golden_decode_layer` (a torch reference mirroring the kernel's
+# math AND its bf16 cast points), runs qwen3_decode_mpmd on device through the
+# `golden/` harness (golden.run_jit), and validates the device output against the
+# golden — no pre-generated data files needed.
+#
+# Fixture scales are chosen so the (unnormalized) residual-stream output stays
+# O(1) and attention is well conditioned: large output magnitudes make the bf16
+# output fail rtol=3e-3 (one bf16 ULP then exceeds the relative tolerance), and a
+# zero-mean / near-uniform attention drives the kernel's bf16-exp / bf16-matmul
+# attention away from an fp32 reference. So past KV is small (current qk-normed
+# token dominates the softmax) and V carries a nonzero mean (stable attention
+# average), while wo / w_down are extra-small (modest residual perturbations).
+# ──────────────────────────────────────────────────────────────────────────────
+
+_REF_ATTN_SCALE = 1.0 / (HEAD_DIM**0.5)
+
+
+def _bf16(t: torch.Tensor) -> torch.Tensor:
+    """Round through bf16 then back to fp32 — emulates a kernel ``pl.cast(BF16)``."""
+    return t.to(torch.bfloat16).to(torch.float32)
+
+
+def _rmsnorm_inv(x: torch.Tensor) -> torch.Tensor:
+    """1/sqrt(mean(x^2, last) + eps), keepdim — the kernel's deferred denominator."""
+    return torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + EPS)
+
+
+def _rope_half(vec: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Kernel RoPE (NeoX half-split): rot_lo = lo*cos_lo - hi*sin_lo ; rot_hi = hi*cos_hi + lo*sin_hi."""
+    lo, hi = vec[..., :HALF_DIM], vec[..., HALF_DIM:]
+    cos_lo, cos_hi = cos[..., :HALF_DIM], cos[..., HALF_DIM:]
+    sin_lo, sin_hi = sin[..., :HALF_DIM], sin[..., HALF_DIM:]
+    return torch.cat([lo * cos_lo - hi * sin_lo, hi * cos_hi + lo * sin_hi], dim=-1)
+
+
+def random_inputs(full_seq: bool = False, seed: int = 1234) -> dict[str, torch.Tensor]:
+    """Deterministic random fixture (name -> tensor) for qwen3_decode_mpmd.
+
+    full_seq: set every sequence length to MAX_SEQ (full KV cache) for a stable,
+    maximum-load performance run; otherwise sample varied lengths in [1, MAX_SEQ].
+    """
+    g = torch.Generator().manual_seed(seed)
+
+    def rn(shape, std=1.0, bias=0.0):
+        return torch.empty(shape).normal_(0.0, std, generator=g) + bias
+
+    if full_seq:
+        seq_lens = torch.full([BATCH], MAX_SEQ, dtype=torch.int32)
+    else:
+        seq_lens = torch.randint(1, MAX_SEQ + 1, (BATCH,), generator=g, dtype=torch.int32)
+
+    # Proper NeoX half-split RoPE tables (cols [0:64] and [64:128] duplicated).
+    posv = torch.arange(MAX_SEQ).float().unsqueeze(1)
+    inv_freq = 1.0 / (1.0e4 ** (torch.arange(0, HALF_DIM).float() / HALF_DIM))
+    ang = posv * inv_freq.unsqueeze(0)
+    rope_cos = torch.cat([ang.cos(), ang.cos()], dim=1).float()
+    rope_sin = torch.cat([ang.sin(), ang.sin()], dim=1).float()
+
+    return {
+        "hidden_states": rn([BATCH, HIDDEN], 1.0).to(torch.bfloat16),
+        "input_rms_weight": rn([1, HIDDEN], 0.1, 1.0).float(),
+        "wq": rn([HIDDEN, HIDDEN], 0.02).to(torch.bfloat16),
+        "wk": rn([HIDDEN, KV_HIDDEN], 0.02).to(torch.bfloat16),
+        "wv": rn([HIDDEN, KV_HIDDEN], 0.02).to(torch.bfloat16),
+        "q_norm_weight": rn([1, HEAD_DIM], 0.1, 1.0).float(),
+        "k_norm_weight": rn([1, HEAD_DIM], 0.1, 1.0).float(),
+        "seq_lens": seq_lens,
+        "rope_cos": rope_cos,
+        "rope_sin": rope_sin,
+        "k_cache": rn([CACHE_ROWS, HEAD_DIM], 0.01).to(torch.bfloat16),
+        "v_cache": rn([CACHE_ROWS, HEAD_DIM], 0.02, 0.3).to(torch.bfloat16),
+        "wo": rn([HIDDEN, HIDDEN], 0.0006).to(torch.bfloat16),
+        "w_gate": rn([HIDDEN, INTERMEDIATE], 0.02).to(torch.bfloat16),
+        "w_up": rn([HIDDEN, INTERMEDIATE], 0.02).to(torch.bfloat16),
+        "w_down": rn([INTERMEDIATE, HIDDEN], 0.0004).to(torch.bfloat16),
+        "post_rms_weight": rn([1, HIDDEN], 0.1, 1.0).float(),
+    }
+
+
+def golden_decode_layer(values: dict) -> None:
+    """Torch reference for ONE Qwen3 decode layer; fills ``values['out']`` in place.
+
+    Mirrors qwen3_decode_mpmd / _decode_layer at layer_idx 0: RMSNorm -> Q/K/V proj
+    -> per-head QK-norm -> RoPE -> KV-cache write at pos=seq_len-1 -> GQA flash
+    attention over [0, seq_len) -> out_proj -> residual -> post-RMSNorm -> SwiGLU
+    MLP -> residual. The deferred input-RMSNorm inv_rms and the QK-norm control
+    scale cancel to the standard math (QK-norm is scale-invariant).
+    """
+    x = values["hidden_states"].float()                          # [B,H], residual source
+    gamma_in = values["input_rms_weight"].float()[0]             # [H]
+    inv_rms = _rmsnorm_inv(x)                                    # [B,1] (deferred)
+
+    normed = _bf16(x * gamma_in)                                 # bf16 normed (no inv_rms yet)
+    q_proj = normed @ values["wq"].float()                      # [B,H]
+    k_proj = normed @ values["wk"].float()                      # [B,KVH]
+    v_proj = normed @ values["wv"].float()                      # [B,KVH]
+
+    qn = values["q_norm_weight"].float()[0]
+    kn = values["k_norm_weight"].float()[0]
+    qh = (q_proj * inv_rms).reshape(BATCH, NUM_HEADS, HEAD_DIM)
+    qh = qh * _rmsnorm_inv(qh) * qn                              # per-head QK-norm
+    kh = (k_proj * inv_rms).reshape(BATCH, NUM_KV_HEADS, HEAD_DIM)
+    kh = kh * _rmsnorm_inv(kh) * kn
+    v_heads = (v_proj * inv_rms).reshape(BATCH, NUM_KV_HEADS, HEAD_DIM)
+
+    seq_lens = values["seq_lens"]
+    rope_cos = values["rope_cos"].float()
+    rope_sin = values["rope_sin"].float()
+    k_cache = values["k_cache"].float()
+    v_cache = values["v_cache"].float()
+
+    attn_out = torch.zeros(BATCH, HIDDEN)
+    for b in range(BATCH):
+        slen = int(seq_lens[b].item())
+        p = slen - 1
+        cos_p, sin_p = rope_cos[p], rope_sin[p]
+        q_b = _bf16(_rope_half(qh[b], cos_p, sin_p))             # [40,128] current Q (bf16)
+        k_cur = _bf16(_rope_half(kh[b], cos_p, sin_p))           # [8,128] current K (bf16)
+        v_cur = _bf16(v_heads[b])                                # [8,128]
+        for kvh in range(NUM_KV_HEADS):
+            base = (b * NUM_KV_HEADS + kvh) * MAX_SEQ
+            k_lane = k_cache[base : base + slen].clone()         # past from cache; current at pos
+            v_lane = v_cache[base : base + slen].clone()
+            k_lane[p] = k_cur[kvh]
+            v_lane[p] = v_cur[kvh]
+            for j in range(Q_PER_KV):
+                hq = kvh * Q_PER_KV + j
+                scores = (q_b[hq].unsqueeze(0) * k_lane).sum(-1) * _REF_ATTN_SCALE
+                w = torch.softmax(scores, dim=-1)
+                attn_out[b, hq * HEAD_DIM : (hq + 1) * HEAD_DIM] = (w.unsqueeze(-1) * v_lane).sum(0)
+    attn_out = _bf16(attn_out)
+
+    attn_proj = attn_out @ values["wo"].float()                  # out_proj
+    h1 = x + attn_proj                                           # raw residual
+    h1_bf16 = _bf16(h1)
+    post_gamma = values["post_rms_weight"].float()[0]
+    post_inv = _rmsnorm_inv(h1)                                  # deferred into silu
+    mlp_in = _bf16(h1 * post_gamma)                              # gamma before inv_rms
+    gate = mlp_in @ values["w_gate"].float()
+    up = mlp_in @ values["w_up"].float()
+    sg = gate * post_inv
+    su = up * post_inv
+    mlp = _bf16(sg * torch.sigmoid(sg) * su)                     # SwiGLU
+    down = mlp @ values["w_down"].float()
+    values["out"] = _bf16(down + h1_bf16).to(torch.bfloat16)     # residual is bf16(h1)
+
+
+def _build_specs(inputs: dict) -> list:
+    """TensorSpec list in qwen3_decode_mpmd parameter order, from a fixture dict."""
+    from golden import TensorSpec  # repo root added to sys.path in __main__
+
+    specs = [
+        TensorSpec(name, list(inputs[name].shape), inputs[name].dtype, init_value=inputs[name])
+        for name in INPUT_NAMES
+    ]
+    specs.append(TensorSpec("out", [BATCH, HIDDEN], torch.bfloat16, is_output=True))
+    return specs
+
+
 if __name__ == "__main__":
+    import sys
+
+    # The `golden/` harness lives at the repo root, which is not on sys.path when
+    # this script is launched directly (only its own dir is). CI sets PYTHONPATH to
+    # the repo root, so this insert is the standalone-run fallback.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "-p",
@@ -1173,12 +1343,19 @@ if __name__ == "__main__":
     )
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser.add_argument("--max-seq", action="store_true", default=False,
+                        help="set EVERY sequence length to MAX_SEQ (full KV cache) for a stable, "
+                             "maximum-load performance run; default samples varied random lengths.")
+    parser.add_argument("--seed", type=int, default=1234,
+                        help="RNG seed for the random fixture (reproducible inputs + golden).")
     parser.add_argument(
         "--data-dir",
         type=Path,
         default=Path(__file__).parent / "build_output" / "data",
+        help="only used by --validate-fwd (pre-generated stacked-fwd inputs).",
     )
-    parser.add_argument("--smoke", action="store_true", default=False)
+    parser.add_argument("--smoke", action="store_true", default=False,
+                        help="compile-only (no device); also the implicit behavior on *sim platforms.")
     parser.add_argument("--no-dep-gen", action="store_true", default=False,
                         help="disable dep_gen (avoids 'register failed: 8' overflow on big graphs)")
     parser.add_argument("--validate-fwd", action="store_true", default=False,
@@ -1188,35 +1365,59 @@ if __name__ == "__main__":
     parser.add_argument("--fwd-layers", type=int, default=4, help="layer count N for --validate-fwd")
     args = parser.parse_args()
 
-    # Golden data lives under build_output/ (gitignored) and is produced by
-    # gen_e2e_golden.py. When it is absent (e.g. CI's `python decode_layer.py
-    # -p a2a3sim` sweep), fall back to a compile-only smoke instead of failing
-    # on the missing inputs — codegen regressions are still caught.
-    golden_available = (args.data_dir / "in" / "hidden_states.pt").exists() and (
-        args.data_dir / "out" / "out.pt"
-    ).exists()
-    if args.smoke or not golden_available:
-        if not args.smoke:
-            print(
-                f"[decode_layer] golden data not found under {args.data_dir}; running "
-                "compile-only smoke (generate it with gen_e2e_golden.py to validate numerics)."
-            )
-        set_backend_type(_backend_type(args.platform))
-        smoke_inputs = _smoke_inputs()
+    set_backend_type(_backend_type(args.platform))
+
+    # Compile-only smoke: explicit --smoke, or any *sim platform (the CI
+    # `python decode_layer.py -p a2a3sim` sweep — codegen regressions are still
+    # caught without needing a device or the heavy full-graph simulation).
+    if args.smoke or args.platform.endswith("sim"):
         smoke_out = torch.empty([BATCH, HIDDEN], dtype=torch.bfloat16)
-        post_pass = qwen3_decode_mpmd.compile_for_test(*smoke_inputs, smoke_out)
+        post_pass = qwen3_decode_mpmd.compile_for_test(*_smoke_inputs(), smoke_out)
         print(f"Compiled program has {len(post_pass.functions)} function(s):")
         for fn in post_pass.functions.values():
             print(f"  {fn.name}: {fn.func_type}")
         raise SystemExit(0)
 
-    backend_type = _backend_type(args.platform)
+    # ── Default single-layer unit test: RANDOM inputs, on-the-fly torch golden,
+    # on-device run + compare, all through the golden/ harness. ──
+    if not args.validate_fwd:
+        from golden import ratio_allclose, run_jit
+
+        inputs = random_inputs(full_seq=args.max_seq, seed=args.seed)
+        specs = _build_specs(inputs)
+        print(f"[decode_layer] single-layer golden unit test | platform={args.platform} "
+              f"device={args.device} seq={'MAX' if args.max_seq else 'varied'} seed={args.seed} "
+              f"seq_lens={inputs['seq_lens'].tolist()}")
+        # Ratio tolerance: bf16 outputs cannot satisfy a strict 100% allclose at
+        # rtol/atol=3e-3 (one bf16 ULP at value 1 is 2**-8 ≈ 0.0039 > 3e-3), so allow
+        # up to 2% outliers — the codebase's ratio_allclose convention. Remaining
+        # mismatches are 1-2 ULP bf16 quantization, not errors.
+        result = run_jit(
+            fn=qwen3_decode_mpmd,
+            specs=specs,
+            golden_fn=golden_decode_layer,
+            runtime_cfg=dict(
+                platform=args.platform,
+                device_id=args.device,
+                enable_l2_swimlane=args.enable_l2_swimlane,
+                enable_dep_gen=not args.no_dep_gen,
+            ),
+            rtol=3e-3,
+            atol=3e-3,
+            compare_fn={"out": ratio_allclose(atol=3e-3, rtol=3e-3, max_error_ratio=0.02)},
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            raise SystemExit(1)
+        raise SystemExit(0)
+
+    # ── --validate-fwd: pre-generated stacked-fwd inputs from --data-dir. ──
     inputs = load_inputs(args.data_dir / "in")
-    out = torch.zeros(BATCH, HIDDEN, dtype=torch.bfloat16)
     run_cfg = RunConfig(
         platform=args.platform,
         device_id=args.device,
-        backend_type=backend_type,
+        backend_type=_backend_type(args.platform),
         enable_l2_swimlane=args.enable_l2_swimlane,
         enable_dep_gen=not args.no_dep_gen,
         dump_passes=True,
@@ -1266,27 +1467,3 @@ if __name__ == "__main__":
               f"logits {int(close.sum())/a.numel():.4%} within 5e-2 | "
               f"max_abs_err={(a-e).abs().max():.4f} | kernel_argmax={amax_k.tolist()} ref_argmax={amax_r.tolist()}")
         raise SystemExit(0 if argmax_match == BATCH else 1)
-
-    # Default: single-layer qwen3_decode_mpmd against the golden out.pt.
-    qwen3_decode_mpmd(*inputs, out, config=run_cfg)
-
-    expected = torch.load(args.data_dir / "out" / "out.pt", weights_only=True)
-    actual = out.cpu()
-    expected = expected.cpu()
-    # Ratio-based tolerance: bf16 outputs cannot satisfy a strict 100% allclose at
-    # rtol/atol=3e-3 (one bf16 ULP at value 1 is 2**-8 ≈ 0.0039 > 3e-3), so require
-    # >= 98% of elements within tolerance instead — the codebase's ratio_allclose
-    # convention. Remaining mismatches are 1-2 ULP bf16 quantization, not errors.
-    MATCH_THRESHOLD = 0.98
-    close = torch.isclose(actual, expected, rtol=3e-3, atol=3e-3)
-    total = actual.numel()
-    matches = int(close.sum().item())
-    match_ratio = matches / total
-    max_abs = (actual.float() - expected.float()).abs().max().item()
-    if match_ratio < MATCH_THRESHOLD:
-        print(f"FAIL: only {match_ratio:.4%} of elements within tol (rtol=3e-3, atol=3e-3); "
-              f"need >= {MATCH_THRESHOLD:.0%}. mismatches={total - matches}/{total}, "
-              f"max_abs_err={max_abs:.5f}")
-        raise SystemExit(1)
-    print(f"PASS: {match_ratio:.4%} of elements within tol (rtol=3e-3, atol=3e-3) "
-          f">= {MATCH_THRESHOLD:.0%} | mismatches={total - matches}/{total} | max_abs_err={max_abs:.5f}")
