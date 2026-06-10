@@ -93,8 +93,9 @@ def combine_ep(
     # one pl.at(CORE_GROUP) so remote_store + notify/wait stay one atomic task.
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine_push"):
         # Each (dst, e) block of n rows landed at slots [src_off, src_off+n) on
-        # dst. Per-row 3D pl.load on recv_y (don't reshape to 2D — that loads the
-        # whole [N_LOCAL_EXPERTS, RECV_MAX, D] into Vec).
+        # dst. Keep the per-row pl.load + remote_store form: with pld.tensor.put
+        # the orchestration marks the routed_y_buf dst window add_input, so
+        # combine_reduce gets no RAW edge and reads it stale (pypto#1732).
         for dst in pl.range(EP_WORLD_SIZE):
             for e in pl.range(N_LOCAL_EXPERTS):
                 n = pl.cast(pl.read(pub_counts, [dst * EP_WORLD_SIZE + my_rank, e]), pl.INDEX)
@@ -132,19 +133,15 @@ def combine_ep(
                 )
 
     # reduce: ffn_out[t] = sh[t] + Σ_k routed_y_buf[t*TOPK+k]. Separate pl.spmd
-    # scope (ordered after the push via the window write->read dep). routed_y_buf
-    # must be pl.load-ed, which forces the whole reduce tile-level: cast/add can't
-    # run on a window slice, nor be assembled to a local tensor in-scope (pypto#1694).
+    # scope (ordered after the push via the window write->read dep).
     for tb in pl.spmd(T // 4, name_hint="combine_reduce"):
         for tt in pl.range(4):
             t = tb * 4 + tt
-            sh_tile = pl.load(sh, [t, 0], [1, D])
-            acc = pl.cast(sh_tile, target_type=pl.FP32)
+            acc = pl.cast(sh[t:t + 1, :], target_type=pl.FP32)
             for k in pl.range(TOPK):
-                y_k = pl.load(routed_y_buf, [t * TOPK + k, 0], [1, D])
-                acc = pl.add(acc, pl.cast(y_k, target_type=pl.FP32))
-            acc_bf16 = pl.cast(acc, target_type=pl.BF16, mode="rint")
-            pl.store(acc_bf16, [t, 0], ffn_out)
+                r = t * TOPK + k
+                acc = pl.add(acc, pl.cast(routed_y_buf[r:r + 1, :], target_type=pl.FP32))
+            ffn_out[t:t + 1, :] = pl.cast(acc, target_type=pl.BF16, mode="rint")
 
 
 @pl.jit
