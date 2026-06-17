@@ -36,7 +36,6 @@ from moe_ep import (
     build_tensor_specs as build_moe_tensor_specs,
     golden_moe_ep,
     moe_ep,
-    prefill_layer_select_active_x_attn,
 )
 from config import FLASH as MODEL_CONFIG
 from prefill_attention_swa import (
@@ -45,7 +44,7 @@ from prefill_attention_swa import (
     _resolve_swa_case,
     build_tensor_specs as build_swa_attention_tensor_specs,
     golden_prefill_attention_swa,
-    prefill_attention_swa_core,
+    prefill_attention_swa,
 )
 from prefill_attention_hca import (
     COMPRESS_RATIO as HCA_COMPRESS_RATIO,
@@ -58,7 +57,7 @@ from prefill_attention_hca import (
     _resolve_hca_case,
     build_tensor_specs as build_hca_attention_tensor_specs,
     golden_prefill_attention_hca,
-    prefill_attention_hca_core,
+    prefill_attention_hca,
 )
 from prefill_attention_csa import (
     BLOCK_SIZE,
@@ -92,7 +91,7 @@ from prefill_attention_csa import (
     _resolve_csa_case,
     build_tensor_specs as build_csa_attention_tensor_specs,
     golden_prefill_attention_csa,
-    prefill_attention_csa_core,
+    prefill_attention_csa,
 )
 
 
@@ -101,9 +100,12 @@ assert SWA_BLOCK_SIZE == BLOCK_SIZE, "SWA/HCA/CSA must share the PyPTO block siz
 assert SWA_ORI_BLOCK_NUM == HCA_ORI_BLOCK_NUM == CSA_ORI_BLOCK_NUM
 assert HCA_CMP_BLOCK_NUM == CSA_CMP_BLOCK_NUM
 
+ACTIVE_TOKEN_TILE = 16
+ACTIVE_D_TILE = 512
+
 
 @pl.jit
-def prefill_layer_moe_ep(
+def prefill_layer(
     x_hc: pl.Tensor[[T, HC_MULT, D], pl.BF16],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
@@ -202,7 +204,7 @@ def prefill_layer_moe_ep(
     my_rank: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, HC_MULT, D], pl.BF16]:
     if layer_id < 2:
-        kv_cache, x_attn = prefill_attention_swa_core(
+        kv_cache, x_attn = prefill_attention_swa(
             x_hc,
             hc_attn_fn,
             hc_attn_scale,
@@ -231,7 +233,7 @@ def prefill_layer_moe_ep(
             num_tokens,
         )
     elif layer_id % 2 == 1:
-        x_attn = prefill_attention_hca_core(
+        x_attn = prefill_attention_hca(
             x_hc,
             hc_attn_fn,
             hc_attn_scale,
@@ -280,7 +282,7 @@ def prefill_layer_moe_ep(
             csa_inner_kv_state,
             csa_inner_score_state,
             x_attn,
-        ) = prefill_attention_csa_core(
+        ) = prefill_attention_csa(
             x_hc,
             hc_attn_fn,
             hc_attn_scale,
@@ -330,7 +332,33 @@ def prefill_layer_moe_ep(
             num_tokens,
         )
     x_moe = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
-    x_moe = prefill_layer_select_active_x_attn(x_attn, x_hc, x_moe, num_tokens)
+    x_attn_flat = pl.reshape(x_attn, [T * HC_MULT, D])
+    x_hc_flat = pl.reshape(x_hc, [T * HC_MULT, D])
+    x_moe_flat = pl.reshape(x_moe, [T * HC_MULT, D])
+    for act_t0 in pl.parallel(0, T, ACTIVE_TOKEN_TILE):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_layer_prepare_x_moe"):
+            for act_dt in pl.range(ACTIVE_TOKEN_TILE):
+                act_t = act_t0 + act_dt
+                if act_t < T:
+                    for act_h in pl.range(HC_MULT):
+                        act_row = (act_t * HC_MULT) + act_h
+                        for act_d0 in pl.range(0, D, ACTIVE_D_TILE):
+                            if act_t < num_tokens:
+                                act_tile = pl.load(
+                                    x_attn_flat,
+                                    [act_row, act_d0],
+                                    [1, ACTIVE_D_TILE],
+                                    target_memory=pl.MemorySpace.Vec,
+                                )
+                            else:
+                                act_tile = pl.load(
+                                    x_hc_flat,
+                                    [act_row, act_d0],
+                                    [1, ACTIVE_D_TILE],
+                                    target_memory=pl.MemorySpace.Vec,
+                                )
+                            x_moe_flat = pl.store(act_tile, [act_row, act_d0], x_moe_flat)
+    x_moe = pl.reshape(x_moe_flat, [T, HC_MULT, D])
     x_next = moe_ep(
         x_moe,
         hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
@@ -349,7 +377,7 @@ def prefill_layer_moe_ep(
 
 
 @pl.jit.host
-def l3_prefill_layer_moe_ep(
+def l3_prefill_layer(
     x_hc: pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.BF16],
     hc_attn_fn: pl.Tensor[[N_RANKS, MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[N_RANKS, 3], pl.FP32],
@@ -457,7 +485,7 @@ def l3_prefill_layer_moe_ep(
         recv_r_route = pld.window(recv_r_route_buf, [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
         routed_y_buf = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
         combine_done = pld.window(combine_done_buf, [N_RANKS, 1], dtype=pl.INT32)
-        prefill_layer_moe_ep(
+        prefill_layer(
             x_hc[rank],
             hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank],
             attn_norm_w[rank], wq_a[rank], wq_b[rank], wq_b_scale[rank],
@@ -813,7 +841,7 @@ def build_tensor_specs(start_pos=START_POS, num_tokens=MAX_TOKENS, case="custom"
     return [tensor_by_name[name] for name in HOST_TENSOR_ORDER] + ordered_scalars
 
 
-def golden_prefill_layer_moe_ep(tensors):
+def golden_prefill_layer(tensors):
     import torch
     from golden import TensorSpec
 
@@ -932,14 +960,14 @@ if __name__ == "__main__":
     kind = _attention_kind_for_layer(args.layer_id)
     compare_tokens = _resolve_compare_tokens(args)
     result = run_jit(
-        fn=l3_prefill_layer_moe_ep,
+        fn=l3_prefill_layer,
         specs=build_tensor_specs(
             start_pos=args.start_pos,
             num_tokens=args.num_tokens,
             case=args.case,
             layer_id=args.layer_id,
         ),
-        golden_fn=golden_prefill_layer_moe_ep,
+        golden_fn=golden_prefill_layer,
         compile_only=args.compile_only,
         compile_cfg=dict(
             distributed_config=DistributedConfig(
